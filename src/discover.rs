@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::agent::is_job_id;
 use crate::host;
 
 pub(crate) const CTX_SCAN: &str = "discover-scan";
@@ -18,7 +19,74 @@ pub(crate) const CTX_SCAN: &str = "discover-scan";
 /// misses it.
 const TOOLS: [&str; 2] = ["claude", "codex"];
 
-/// One `ps` for every process, filtered in awk.
+/// Background agents from Claude Code's own agent view (`claude agents`).
+///
+/// These have a pid but no pane, so the `ps` scan above cannot see them: it
+/// keys on `ZELLIJ_PANE_ID`, which a daemon-spawned session never inherits.
+/// `claude agents --json` is the same list the agent view renders, and it
+/// answers in ~100ms, so it is affordable on every scan.
+///
+/// Two passes, because they answer different questions and one must not be able
+/// to break the other:
+///
+/// - `jobs/<id>/state.json` says which agents **exist**, the way the process
+///   scan does for panes, and carries everything a row renders: the agent
+///   view's own detail line, `tempo`, the subagent fan-out and the token count.
+///   It is the only thing that can create a row.
+/// - `agents --json` only **refines** a row that already exists, with the pid
+///   and the live status. Losing it costs liveness, never the row.
+///
+/// The passes are that way round because of a CLI quirk worth stating plainly:
+/// **`claude agents --json` ignores `CLAUDE_CONFIG_DIR`.** It answers for
+/// whichever account it resolves on its own, so asking it once per config dir
+/// returns that same account's agents every time - the same rows duplicated,
+/// not each account's. The job directories have no such problem, and a fleet
+/// routinely spans several accounts, so the dirs are globbed and read directly.
+/// That is also why the live pass runs exactly once, outside the loop.
+///
+/// `--json` lists only *active* sessions, so a row it omits is not necessarily
+/// gone - it may simply have finished. Completed agents are therefore aged out
+/// on `age` rather than culled for being absent from the live set.
+///
+/// `age` is seconds, computed here rather than sent as an epoch, because the
+/// plugin has no wall clock - the same constraint that makes the hook compute
+/// `tool_secs` itself and the spool date its records relative to each other.
+///
+/// The shell only concatenates; every decision about the payload is made in
+/// `parse`, which is why the two passes are emitted as separate tagged lines
+/// and joined on `id` in Rust rather than in jq.
+fn job_scan() -> &'static str {
+    r#"
+if [ "${ZJ_AGENT_JOBS:-1}" != 0 ] && command -v jq >/dev/null 2>&1; then
+  CLAUDE_BIN=$(command -v claude 2>/dev/null)
+  if [ -z "$CLAUDE_BIN" ]; then
+    for c in "$HOME/.local/sbin/claude" "$HOME/.local/bin/claude" /usr/local/bin/claude; do
+      if [ -x "$c" ]; then CLAUDE_BIN="$c"; break; fi
+    done
+  fi
+  if [ -n "$CLAUDE_BIN" ]; then
+    "$CLAUDE_BIN" agents --json 2>/dev/null | jq -r '
+      .[]? | select(.id != null) |
+      "JOBLIVE id=\(.id),pid=\(.pid // 0),status=\(.status // ""),state=\(.state // ""),kind=\(.kind // "")"
+    ' 2>/dev/null
+  fi
+  for cfg in "$HOME"/.claude "$HOME"/.claude-account-*; do
+    [ -d "$cfg/jobs" ] || continue
+    acct=$(basename "$cfg" | sed -e 's/^\.claude-account-//' -e 's/^\.claude$/default/')
+    jq -r --arg acct "$acct" '
+      select(.daemonShort != null) |
+      (try ((.updatedAt // "") | sub("\\.[0-9]+";"") | fromdateiso8601) catch 0) as $u |
+      (if $u > 0 then ((now - $u) | floor) else -1 end) as $age |
+      "JOB id=\(.daemonShort),acct=\($acct),state=\(.state // ""),tempo=\(.tempo // ""),age=\($age),fan=\((.fan // []) | length),tokens=\(.tokens // 0),term=\(if .lastTerminalAt == null then 0 else 1 end),cwd=\(.cwd // ""),name=\(((.name // "") | gsub("\\s+";" ") | gsub(",";" "))[0:60]),detail=\(((.detail // "") | gsub("\\s+";" ") | gsub(",";" "))[0:160])"
+    ' "$cfg"/jobs/*/state.json 2>/dev/null
+  done
+fi
+"#
+}
+
+/// One `ps` for every process, filtered in awk, plus the spool and the job
+/// scan - one dispatch for every source, since they are always consumed
+/// together.
 ///
 /// `ps axeww` is required to get environments. The POSIX `-e` and the BSD `e`
 /// collide silently on macOS: `ps -e eww` still exits 0 and still prints a
@@ -29,6 +97,7 @@ pub(crate) fn scan_script(tools: &[&str]) -> String {
         .map(|t| format!("cmd != \"{}\"", t))
         .collect::<Vec<_>>()
         .join(" && ");
+    let job_scan = job_scan();
     // One invocation for both sources: a second dispatch would double the poll
     // cost for data that is always consumed together.
     format!(
@@ -57,6 +126,7 @@ pub(crate) fn scan_script(tools: &[&str]) -> String {
 }}' | sort -u
 SPOOL_DIR="${{ZJ_AGENT_SPOOL_DIR:-${{TMPDIR:-/tmp}}/zj-agent-mob-$(id -u 2>/dev/null || echo 0)/status}}"
 grep -s -H '' "$SPOOL_DIR"/* 2>/dev/null | sed 's/^/SPOOL /'
+{job_scan}
 find "$SPOOL_DIR" -type f -mtime +1 -delete 2>/dev/null
 # Beacons for panels that are gone, so fan-out stops chasing a session with
 # nothing listening. The window is generous on purpose: a beacon is refreshed
@@ -107,6 +177,42 @@ pub(crate) struct Found {
     pub(crate) tool: String,
 }
 
+/// A background agent from Claude Code's agent view, read from its job state.
+///
+/// `id` is the daemon's short id - the first block of the session uuid, eight
+/// lowercase hex digits - which is what `claude attach` and `claude stop` take.
+pub(crate) struct Job {
+    pub(crate) id: String,
+    /// Which account's config dir it came from: `personal`, `work`, `default`.
+    /// A fleet spans accounts and a bare row cannot say which one it is in.
+    pub(crate) acct: String,
+    /// `working`, `done` or `blocked`.
+    pub(crate) state: String,
+    /// `active`, `idle` or `blocked`.
+    pub(crate) tempo: String,
+    /// Seconds since the job last wrote its state, computed in the shell
+    /// because the plugin has no wall clock. Negative when unknown.
+    pub(crate) age: i64,
+    /// Subagents in flight, the `fan` the agent view shows underneath a row.
+    pub(crate) fan: u32,
+    /// True once the job has terminated at least once (`lastTerminalAt` set).
+    pub(crate) terminated: bool,
+    pub(crate) cwd: String,
+    pub(crate) name: String,
+    pub(crate) detail: String,
+}
+
+/// The live half of the job scan: `claude agents --json`, which knows the pid
+/// but only for the one account the CLI resolves. Refines a `Job`, never
+/// creates one.
+pub(crate) struct JobLive {
+    pub(crate) id: String,
+    /// `busy` or `idle`. The one thing this pass knows that the job record does
+    /// not: whether an agent that calls itself working is actually working or
+    /// sitting at a prompt.
+    pub(crate) status: String,
+}
+
 /// One agent's status record, read from the spool.
 pub(crate) struct Spooled {
     pub(crate) session: String,
@@ -119,6 +225,10 @@ pub(crate) struct Spooled {
 pub(crate) struct Scan {
     pub(crate) found: Vec<Found>,
     pub(crate) spooled: Vec<Spooled>,
+    /// Background agents from the agent view. Keyed by their own short id
+    /// rather than a pane, because they do not have one.
+    pub(crate) jobs: Vec<Job>,
+    pub(crate) job_live: Vec<JobLive>,
     /// Sanitized names of every session with a running Zellij server.
     /// `SessionUpdate` reports only the panel's own, so this is the only
     /// source that can speak for a foreign session's liveness.
@@ -177,6 +287,46 @@ pub(crate) fn parse(stdout: &str) -> Scan {
                         tool: tool.to_string(),
                     });
                 }
+            }
+            // A background agent's job state. Same `key=value,...` shape as a
+            // spool record, so it parses with the same splitter.
+            "JOB" => {
+                let args = parse_args(rest);
+                let Some(id) = args.get("id").filter(|s| is_job_id(s)).cloned() else {
+                    continue;
+                };
+                // First record wins. The same job can appear under two config
+                // dirs when they share a jobs directory, and one agent must
+                // not become two rows.
+                if scan.jobs.iter().any(|j| j.id == id) {
+                    continue;
+                }
+                let s = |k: &str| args.get(k).cloned().unwrap_or_default();
+                scan.jobs.push(Job {
+                    id,
+                    acct: s("acct"),
+                    state: s("state"),
+                    tempo: s("tempo"),
+                    age: args.get("age").and_then(|a| a.parse::<i64>().ok()).unwrap_or(-1),
+                    fan: args.get("fan").and_then(|f| f.parse::<u32>().ok()).unwrap_or(0),
+                    terminated: args.get("term").map(String::as_str) == Some("1"),
+                    cwd: s("cwd"),
+                    name: s("name"),
+                    detail: s("detail"),
+                });
+            }
+            "JOBLIVE" => {
+                let args = parse_args(rest);
+                let Some(id) = args.get("id").filter(|s| is_job_id(s)).cloned() else {
+                    continue;
+                };
+                if scan.job_live.iter().any(|j| j.id == id) {
+                    continue;
+                }
+                scan.job_live.push(JobLive {
+                    id,
+                    status: args.get("status").cloned().unwrap_or_default(),
+                });
             }
             // `<path>:<record>`, one line per file from `grep -H`. The shell
             // only concatenates; every decision about the payload is made here.
@@ -246,6 +396,66 @@ mod tests {
         assert_eq!(found[0].tool, "claude");
         assert_eq!(found[1].tool, "codex");
         assert_eq!(found[2].session, "other");
+    }
+
+    #[test]
+    fn parses_a_background_agent_from_its_job_state() {
+        let jobs = scan_of(
+            "JOB id=3848ccf2,acct=personal,state=working,tempo=active,age=10,fan=2,tokens=51157,term=0,cwd=/repo,name=fork the plugin,detail=mapping code changes\n",
+        )
+        .jobs;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "3848ccf2");
+        assert_eq!(jobs[0].acct, "personal");
+        assert_eq!(jobs[0].state, "working");
+        assert_eq!(jobs[0].tempo, "active");
+        assert_eq!(jobs[0].age, 10);
+        assert_eq!(jobs[0].fan, 2);
+        assert!(!jobs[0].terminated);
+        assert_eq!(jobs[0].name, "fork the plugin");
+        assert_eq!(jobs[0].detail, "mapping code changes");
+    }
+
+    /// The id is packed into a `pane_id`, so anything that is not exactly eight
+    /// hex digits would land as a plausible-looking pane number for a pane that
+    /// exists and belongs to somebody else.
+    #[test]
+    fn rejects_an_id_that_is_not_a_job_id() {
+        for id in ["", "3848ccf", "3848ccf22", "3848CCF2", "zzzzzzzz", "3848-cf2"] {
+            let line = format!("JOB id={},acct=personal,state=working,age=1\n", id);
+            assert!(scan_of(&line).jobs.is_empty(), "accepted {:?} as a job id", id);
+        }
+    }
+
+    /// Two config dirs can name the same job. One agent, one row.
+    #[test]
+    fn the_same_job_under_two_accounts_is_one_row() {
+        let jobs = scan_of(concat!(
+            "JOB id=3848ccf2,acct=personal,state=working,age=1\n",
+            "JOB id=3848ccf2,acct=work,state=done,age=9999\n",
+        ))
+        .jobs;
+        assert_eq!(jobs.len(), 1, "one agent, not one per config dir");
+        assert_eq!(jobs[0].acct, "personal", "first record wins");
+    }
+
+    #[test]
+    fn parses_the_live_pass_separately() {
+        let scan = scan_of(concat!(
+            "JOBLIVE id=3848ccf2,pid=1124006,status=busy,state=working,kind=background\n",
+            "JOB id=3848ccf2,acct=personal,state=working,age=1\n",
+        ));
+        assert_eq!(scan.job_live.len(), 1);
+        assert_eq!(scan.job_live[0].status, "busy");
+        assert_eq!(scan.jobs.len(), 1, "the live pass does not also create a job");
+    }
+
+    /// A missing `age` must not read as "0 seconds old", which would pin a row
+    /// the window is supposed to age out.
+    #[test]
+    fn an_absent_age_is_unknown_rather_than_current() {
+        let jobs = scan_of("JOB id=3848ccf2,acct=personal,state=done\n").jobs;
+        assert_eq!(jobs[0].age, -1);
     }
 
     #[test]
@@ -417,6 +627,11 @@ mod tests {
                 .arg(scan_script(&TOOLS))
                 .env("PATH", path)
                 .env("ZJ_AGENT_SPOOL_DIR", &spool_dir)
+                // These assert the process-and-spool contract byte for byte, and
+                // the job pass reads the real `$HOME`: left on, whichever agents
+                // happen to be running on the machine would append themselves to
+                // every expectation below. It has its own tests.
+                .env("ZJ_AGENT_JOBS", "0")
                 .output()
                 .expect("sh runs");
             let _ = std::fs::remove_dir_all(&dir);

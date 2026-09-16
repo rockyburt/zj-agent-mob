@@ -36,6 +36,23 @@ pub(crate) const STALE_AFTER: f64 = 60.0;
 /// inside `STALE_AFTER`, so a row gets many chances to refresh before it decays.
 pub(crate) const SPOOL_POLL_INTERVAL: f64 = 5.0;
 
+/// How long a finished background agent stays on the list, in seconds.
+///
+/// Background agents outlive their work: a job directory keeps its record long
+/// after the agent stopped, so without a window the panel fills with days of
+/// completed runs and the agents that still need you are pushed off screen.
+/// Six hours keeps the working day visible while a run from last week is not.
+///
+/// Only finished rows are aged. A `working` or `blocked` agent stays however
+/// long it has been sitting there - that it has been blocked for hours is the
+/// single most useful thing the panel can tell you, not a reason to hide it.
+pub(crate) const JOB_DONE_WINDOW: i64 = 6 * 60 * 60;
+
+/// Resolved on the host's `PATH` rather than as an absolute path, the same way
+/// `session_action` invokes `zellij`: the plugin runs in WASI and cannot look a
+/// binary up, but every command it dispatches runs on the host, which can.
+pub(crate) const CLAUDE_BIN: &str = "claude";
+
 /// Shown in the pane frame instead of the full wasm path.
 pub(crate) const PANE_TITLE: &str = "Agent Mob";
 

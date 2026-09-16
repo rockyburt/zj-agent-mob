@@ -562,7 +562,7 @@ impl State {
                 let a = &self.agents[i];
                 let foreign = !self.session_name.is_empty() && a.session() != self.session_name;
                 match foreign && a.repo.is_empty() {
-                    true => chars(a.session()),
+                    true => chars(&a.display_session()),
                     false => chars(&a.identity()),
                 }
             })

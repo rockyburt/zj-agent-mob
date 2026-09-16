@@ -3,8 +3,9 @@
 
 #[cfg(target_family = "wasm")]
 pub(crate) use zellij_tile::shim::{
-    close_self, close_terminal_pane, focus_terminal_pane, hide_self, open_command_pane_floating, reload_plugin_with_id,
-    run_command, send_sigint_to_pane_id, set_timeout, show_self, switch_session_with_focus, write_chars_to_pane_id,
+    close_self, close_terminal_pane, focus_terminal_pane, hide_self, open_command_pane, open_command_pane_floating,
+    reload_plugin_with_id, run_command, send_sigint_to_pane_id, set_timeout, show_self, switch_session_with_focus,
+    write_chars_to_pane_id,
 };
 
 #[cfg(target_family = "wasm")]
@@ -112,6 +113,42 @@ pub(crate) fn notify(notifier: &str, title: &str, body: &str, sound: bool) {
     }
 }
 
+/// Opens a pane attached to a background agent from Claude Code's agent view.
+///
+/// A tiled pane rather than a floating one: the panel floats and hides itself
+/// on the way out, and what lands is a full interactive session the user is
+/// about to work in, not another overlay.
+///
+/// `cwd` is the agent's own working directory, so the pane opens where the
+/// agent is rather than wherever the panel happened to be launched from.
+#[cfg(target_family = "wasm")]
+pub(crate) fn attach_agent(claude_bin: &str, id: &str, cwd: &str) {
+    use zellij_tile::prelude::CommandToRun;
+    let mut ctx = std::collections::BTreeMap::new();
+    ctx.insert("kind".to_string(), "attach".to_string());
+    open_command_pane(
+        CommandToRun {
+            path: std::path::PathBuf::from(claude_bin),
+            args: vec!["attach".to_string(), id.to_string()],
+            cwd: (!cwd.is_empty()).then(|| std::path::PathBuf::from(cwd)),
+        },
+        ctx,
+    );
+}
+
+/// Stops a background agent. `claude stop` is the agent view's own verb, so the
+/// daemon tears the session down and records it instead of the panel killing a
+/// process out from under it.
+///
+/// The id is its own argv element and is validated as eight hex digits before
+/// it ever gets here, so nothing user-influenced is parsed by a shell.
+#[cfg(target_family = "wasm")]
+pub(crate) fn stop_agent(claude_bin: &str, id: &str) {
+    let mut ctx = std::collections::BTreeMap::new();
+    ctx.insert("kind".to_string(), "stop".to_string());
+    run_command(&[claude_bin, "stop", id], ctx);
+}
+
 /// Acts on a pane in another Zellij session by shelling out to the `zellij`
 /// binary, which takes a session argument where the plugin shims cannot.
 /// Every value is its own argv element.
@@ -176,6 +213,8 @@ mod stub {
     pub(crate) fn notify(_notifier: &str, _title: &str, _body: &str, _sound: bool) {}
     pub(crate) fn session_action(_session: &str, _args: &[&str], _kind: &str) {}
     pub(crate) fn publish_summary(_summary: &str, _path: &str, _kv: &str) {}
+    pub(crate) fn attach_agent(_claude_bin: &str, _id: &str, _cwd: &str) {}
+    pub(crate) fn stop_agent(_claude_bin: &str, _id: &str) {}
     pub(crate) fn write_chars_to_pane_id(_chars: &str, _id: PaneId) {}
     pub(crate) fn open_command_pane_floating(
         _cmd: CommandToRun,

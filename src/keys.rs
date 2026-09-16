@@ -123,6 +123,7 @@ impl State {
         };
         let (id, tab, session_alive) = (agent.id.clone(), agent.tab, agent.session_alive);
         let foreign = id.session != self.session_name && !self.session_name.is_empty();
+        let job = id.job_id().map(|j| (j, agent.cwd.clone()));
 
         if let Some(a) = self.agents.iter_mut().find(|a| a.id == id) {
             if a.status == Status::Done {
@@ -131,7 +132,12 @@ impl State {
             }
         }
 
-        if foreign {
+        if let Some((job_id, cwd)) = job {
+            // A background agent has no pane to focus, so Enter makes one:
+            // `claude attach` is how the agent view itself reaches these, and
+            // it works whatever session - or machine's terminal - you are in.
+            host::attach_agent(crate::CLAUDE_BIN, &job_id, &cwd);
+        } else if foreign {
             // A dead session has no pane to land on; attaching resurrects it.
             let target = if session_alive { Some((id.pane_id, false)) } else { None };
             // The name Zellij knows it by, not the sanitized filename key.
@@ -435,8 +441,17 @@ impl State {
             BareKey::Char('x') => {
                 if let Some(armed) = self.kill_armed.clone() {
                     if self.agents.iter().any(|a| a.id == armed && a.session_alive) {
-                        let foreign = !self.session_name.is_empty() && armed.session != self.session_name;
-                        self.close_pane(&armed, foreign);
+                        match armed.job_id() {
+                            // Closing a pane would be the wrong verb and there
+                            // is no pane anyway: `claude stop` is what the agent
+                            // view uses, so the daemon tears the session down
+                            // and records it rather than losing a process.
+                            Some(job) => host::stop_agent(crate::CLAUDE_BIN, &job),
+                            None => {
+                                let foreign = !self.session_name.is_empty() && armed.session != self.session_name;
+                                self.close_pane(&armed, foreign);
+                            }
+                        }
                         self.agents.retain(|a| a.id != armed);
                         self.kill_armed = None;
                         self.clamp_selection();
@@ -450,8 +465,14 @@ impl State {
                     return false;
                 }
                 if let Some(id) = self.agents.get(self.selected).map(|a| a.id.clone()) {
-                    let foreign = self.selected_is_foreign();
-                    self.interrupt_pane(&id, foreign);
+                    // A background agent has no pty to send Ctrl-C to, so the
+                    // first press only arms the confirm. Sending the interrupt
+                    // anyway would address `pane_id`, which for these rows is a
+                    // packed job id and not a pane at all.
+                    if !id.is_background() {
+                        let foreign = self.selected_is_foreign();
+                        self.interrupt_pane(&id, foreign);
+                    }
                     self.kill_armed = Some(id);
                 }
                 true

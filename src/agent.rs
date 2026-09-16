@@ -14,6 +14,51 @@ pub(crate) struct AgentId {
     pub(crate) pane_id: u32,
 }
 
+/// The reserved session key for background agents from Claude Code's agent
+/// view, which have no pane and so no session to be keyed by.
+///
+/// Safe against collision by construction: `sanitize_session` folds every byte
+/// outside `[A-Za-z0-9._-]` to `_`, so no real Zellij session - whatever it is
+/// called - can ever sanitize to a key containing `@`.
+pub(crate) const BG_SESSION: &str = "@bg";
+
+/// The daemon's short job id: the first block of the session uuid, always
+/// eight lowercase hex digits. Checked rather than assumed, because a malformed
+/// id would otherwise land as a plausible-looking pane number.
+pub(crate) fn is_job_id(s: &str) -> bool {
+    s.len() == 8 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Packs a job id into the `pane_id` slot so background agents can share
+/// `AgentId` with pane agents instead of forcing a second identity type
+/// through every row, sort and lookup in the panel.
+///
+/// Exactly reversible: eight hex digits are exactly a `u32`, and `{:08x}` pads
+/// the leading zero back on, so `job_id_of(job_pane_id(x)) == x` for every id
+/// the daemon issues. That round-trip is what lets a row reconstruct the id
+/// `claude attach` and `claude stop` need without carrying it separately.
+pub(crate) fn job_pane_id(id: &str) -> Option<u32> {
+    is_job_id(id).then(|| u32::from_str_radix(id, 16).ok())?
+}
+
+/// The job id packed into a background row's `pane_id`. Meaningless for a pane
+/// agent, so callers must check `AgentId::is_background` first.
+pub(crate) fn job_id_of(pane_id: u32) -> String {
+    format!("{:08x}", pane_id)
+}
+
+impl AgentId {
+    /// Whether this row is a background agent rather than a pane.
+    pub(crate) fn is_background(&self) -> bool {
+        self.session == BG_SESSION
+    }
+
+    /// The `claude` short id for a background row.
+    pub(crate) fn job_id(&self) -> Option<String> {
+        self.is_background().then(|| job_id_of(self.pane_id))
+    }
+}
+
 /// Mirrors the hook's `LC_ALL=C tr -c 'a-zA-Z0-9._-' '_'`. Folds bytes, not
 /// chars, because `tr` does: "café" -> "caf__", and a char-wise fold would look
 /// for a spool file the hook never wrote.
@@ -179,6 +224,28 @@ impl Agent {
         &self.id.session
     }
 
+    /// What the session cell shows. `BG_SESSION` is an internal key, never a
+    /// name the user would recognize, so a background row names the account its
+    /// job directory came from instead - which is the thing that actually
+    /// distinguishes two background agents once a fleet spans accounts.
+    pub(crate) fn display_session(&self) -> String {
+        match self.id.is_background() {
+            true if !self.pane_title.is_empty() => format!("agents/{}", self.pane_title),
+            true => "agents".to_string(),
+            false => self.id.session.clone(),
+        }
+    }
+
+    /// How the row names its location on the detail line: a pane number for a
+    /// pane agent, and for a background agent the short id, which is what
+    /// `claude attach` and `claude logs` take.
+    pub(crate) fn locator(&self) -> String {
+        match self.id.job_id() {
+            Some(id) => format!("id:{}", id),
+            None => format!("pane:{}", self.pane_id()),
+        }
+    }
+
     /// An agent that has been blocked on you for a long time. The sort already
     /// puts it on top; this says it has stopped being a state and become a fire.
     pub(crate) fn escalated(&self, now: f64) -> bool {
@@ -293,7 +360,7 @@ impl Agent {
             // worktree it is, which is the better answer; the session then
             // moves to the detail line.
             let col = match foreign && self.repo.is_empty() {
-                true => self.session().to_string(),
+                true => self.display_session(),
                 false => self.identity(),
             };
             // The frame's width is capped by the room this row actually has,
@@ -427,12 +494,12 @@ impl Agent {
         // A foreign row whose identity cell went to `repo/wt` still has to say
         // where it lives; a bare pane number is ambiguous across sessions.
         if foreign && !self.repo.is_empty() {
-            bits.push(format!("session:{}", self.session()));
+            bits.push(format!("session:{}", self.display_session()));
         }
         if let Some(t) = self.tab {
             bits.push(format!("tab:{}", t + 1));
         }
-        bits.push(format!("pane:{}", self.pane_id()));
+        bits.push(self.locator());
         if !self.session_alive {
             bits.push("(session exited)".to_string());
         } else if !self.alive {
@@ -542,6 +609,64 @@ impl Agent {
                 p => p,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    /// The whole scheme rests on this: a job id survives the trip through a
+    /// `pane_id` unchanged, or `claude attach` is handed an id for a different
+    /// agent than the row the user pressed Enter on.
+    #[test]
+    fn a_job_id_round_trips_through_the_pane_slot() {
+        // Leading zeros, all-digits, all-letters, and both extremes.
+        for id in [
+            "3848ccf2", "0dc996b0", "00000000", "ffffffff", "9b5700ff", "00a100da", "12345678", "abcdefab",
+        ] {
+            let packed = job_pane_id(id).unwrap_or_else(|| panic!("{} packs", id));
+            assert_eq!(job_id_of(packed), id, "{} did not survive the round trip", id);
+        }
+    }
+
+    #[test]
+    fn only_a_real_job_id_packs() {
+        for id in ["", "3848ccf", "3848ccf22", "3848CCF2", "3848ccg2", " 848ccf2"] {
+            assert_eq!(job_pane_id(id), None, "accepted {:?}", id);
+        }
+    }
+
+    /// `BG_SESSION` shares a namespace with sanitized Zellij session names, so
+    /// a name that could fold onto it would put a pane agent and a background
+    /// agent on the same row.
+    #[test]
+    fn no_session_name_can_collide_with_the_background_key() {
+        for name in ["@bg", "bg", "_bg", "@BG", "a@bg", "@bg ", "my session", ""] {
+            assert_ne!(
+                sanitize_session(name),
+                BG_SESSION,
+                "{:?} sanitized onto the background key",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn a_background_id_reports_itself_and_a_pane_id_does_not() {
+        let bg = AgentId {
+            session: BG_SESSION.to_string(),
+            pane_id: job_pane_id("3848ccf2").unwrap(),
+        };
+        assert!(bg.is_background());
+        assert_eq!(bg.job_id().as_deref(), Some("3848ccf2"));
+
+        let pane = AgentId {
+            session: "mob".to_string(),
+            pane_id: 3,
+        };
+        assert!(!pane.is_background());
+        assert_eq!(pane.job_id(), None, "a pane number is not a job id");
     }
 }
 

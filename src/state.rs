@@ -3,11 +3,65 @@
 use std::collections::BTreeMap;
 use zellij_tile::prelude::*;
 
+use crate::agent::Subagent;
 use crate::agent::{Agent, AgentId, Block};
 use crate::host;
 use crate::install::Install;
 use crate::status::Status;
-use crate::{SIGINT_BYTE, SPINNER, STALE_AFTER, TICK};
+use crate::{JOB_DONE_WINDOW, SIGINT_BYTE, SPINNER, STALE_AFTER, TICK};
+
+/// Whether a background agent still belongs on the list.
+///
+/// An agent that is blocked or still working is always shown, however old it
+/// is: a run that has been blocked since this morning is the row you most need
+/// to see, and an old `working` record with no terminal timestamp is an agent
+/// that died without saying so - also worth seeing, and not something the panel
+/// should quietly hide.
+///
+/// Everything else is finished, and finished agents are aged out. An unknown
+/// age (`-1`, an unparseable timestamp) is treated as too old rather than
+/// current, so a malformed record cannot pin a dead row to the top of the list.
+fn show_job(j: &crate::discover::Job) -> bool {
+    if !j.terminated && (j.state == "working" || j.state == "blocked") {
+        return true;
+    }
+    j.age >= 0 && j.age < JOB_DONE_WINDOW
+}
+
+/// Maps the agent view's own vocabulary onto the panel's statuses.
+///
+/// `state` is the job's, `live` is `claude agents --json` talking about the one
+/// account it answers for. The live status only breaks the tie between an agent
+/// that is genuinely working and one that is sitting at a prompt, because that
+/// is the only thing it knows that the job record does not.
+fn job_status(j: &crate::discover::Job, live: Option<&str>) -> Status {
+    match j.state.as_str() {
+        // The agent view's "needs input" group. `Waiting` rather than
+        // `IdleWait` so it ranks with the permission prompts it is one of.
+        "blocked" => Status::Waiting,
+        "done" => Status::Done,
+        "working" if j.tempo == "blocked" => Status::Waiting,
+        "working" if live == Some("idle") || j.tempo == "idle" => Status::IdleWait,
+        "working" => Status::Working,
+        // A record whose state this build does not know is dropped to a state
+        // that asserts nothing, rather than guessed into one that does.
+        _ => Status::Idle,
+    }
+}
+
+/// The agent view reports its fan-out as a count, not a roster, so the roster
+/// is synthesized to drive the existing live badge. Every entry is unfinished
+/// by construction: a count of what is running is exactly what it is.
+fn fan_subagents(fan: u32, now: f64) -> Vec<Subagent> {
+    (0..fan)
+        .map(|_| Subagent {
+            id: String::new(),
+            kind: "agent".to_string(),
+            started: now,
+            done: None,
+        })
+        .collect()
+}
 
 /// A permission prompt parked by a blocked hook, waiting on a verdict.
 pub(crate) struct Ask {
@@ -351,6 +405,13 @@ impl State {
         let (reported, scanned) = (self.live_sessions.clone(), self.scanned_sessions.clone());
         let mut changed = false;
         for agent in self.agents.iter_mut() {
+            // A background agent is not in any Zellij session, so neither list
+            // can speak for it. Left alone rather than defaulted: the test
+            // below would find it in neither and mark a perfectly live agent
+            // `unknown` on every scan.
+            if agent.id.is_background() {
+                continue;
+            }
             let alive = reported.contains(&agent.id.session) || scanned.contains(&agent.id.session);
             if agent.session_alive != alive {
                 agent.session_alive = alive;
@@ -738,6 +799,13 @@ impl State {
         if !agent.session_alive || agent.status == Status::Unknown {
             return false;
         }
+        // A follow-up is delivered by the agent's own `Stop` hook reading a file
+        // keyed by session and pane. A background agent is keyed by neither, so
+        // nothing would ever consume the file - and the row would sit there
+        // claiming a follow-up was queued when none can be.
+        if agent.id.is_background() {
+            return false;
+        }
         let id = agent.id.clone();
         self.followup = Some(Reply {
             id,
@@ -793,10 +861,16 @@ impl State {
     /// Whether the selected agent can be typed into. Only a blocked agent: any
     /// other state has no prompt waiting, so the keystrokes would land mid-turn
     /// as stray input. A foreign row is reachable through the CLI.
+    ///
+    /// A background agent cannot: typing goes to a pty, and there is no pane
+    /// behind these rows to hold one. Refused rather than attempted, because
+    /// `pane_id` on a background row is a packed job id - a write would address
+    /// some unrelated pane, or none, and silently report success either way.
+    /// <kbd>Enter</kbd> attaches instead, which is the real way in.
     pub(crate) fn can_reply_selected(&self) -> bool {
         self.agents
             .get(self.selected)
-            .map(|a| matches!(a.status, Status::Waiting | Status::IdleWait) && a.session_alive)
+            .map(|a| matches!(a.status, Status::Waiting | Status::IdleWait) && a.session_alive && !a.id.is_background())
             .unwrap_or(false)
     }
 
@@ -969,6 +1043,9 @@ impl State {
         let mut changed = self.apply_scanned_sessions(scan.live);
         changed |= self.merge_found(scan.found);
         changed |= self.apply_spool(scan.spooled);
+        // Last, and independent: background rows share no identity space with
+        // pane rows, so nothing above can have touched them.
+        changed |= self.merge_jobs(scan.jobs, scan.job_live);
         if changed {
             self.clamp_selection();
             self.sort_agents();
@@ -983,6 +1060,13 @@ impl State {
         let home = self.session_name.clone();
         let cull_foreign = self.scan_completed;
         self.agents.retain(|a| {
+            // Background rows belong to `merge_jobs`. The process scan cannot
+            // see an agent with no pane, so letting it cull one here would
+            // destroy and rebuild the row on every scan - resetting the elapsed
+            // timer and marking the panel dirty forever.
+            if a.id.is_background() {
+                return true;
+            }
             let seen = found
                 .iter()
                 .any(|f| f.pane_id == a.pane_id() && f.session == a.id.session);
@@ -1037,6 +1121,111 @@ impl State {
         if changed {
             self.clamp_selection();
             self.sort_agents();
+        }
+        changed
+    }
+
+    /// Merges the background agents from Claude Code's agent view.
+    ///
+    /// These rows are owned end to end by the job scan, which is why this is a
+    /// separate pass rather than more cases inside `merge_found`: a background
+    /// agent has no pane for the process scan to find and no hook piping into
+    /// this session, so neither of the other two sources can speak for it. By
+    /// the same token neither can contradict it, and the merge is free to be a
+    /// straight overwrite instead of the ownership negotiation foreign pane
+    /// rows need.
+    ///
+    /// Pane rows are left strictly alone: the retain below only ever considers
+    /// rows keyed by `BG_SESSION`, so a scan that returns no jobs at all - jq
+    /// missing, `ZJ_AGENT_JOBS=0`, no job directories - culls these rows and
+    /// leaves everything else exactly as it was.
+    fn merge_jobs(&mut self, jobs: Vec<crate::discover::Job>, live: Vec<crate::discover::JobLive>) -> bool {
+        let keep: Vec<(AgentId, crate::discover::Job)> = jobs
+            .into_iter()
+            .filter(show_job)
+            .filter_map(|j| {
+                crate::agent::job_pane_id(&j.id).map(|p| {
+                    (
+                        AgentId {
+                            session: crate::agent::BG_SESSION.to_string(),
+                            pane_id: p,
+                        },
+                        j,
+                    )
+                })
+            })
+            .collect();
+
+        let before = self.agents.len();
+        self.agents
+            .retain(|a| !a.id.is_background() || keep.iter().any(|(id, _)| *id == a.id));
+        let mut changed = self.agents.len() != before;
+
+        for (id, job) in keep {
+            // `--json` answers for one account, so its silence about a row from
+            // another account means nothing. Absent simply leaves the status to
+            // the job record, which is the per-account source of truth.
+            let live_status = live.iter().find(|l| l.id == job.id).map(|l| l.status.as_str());
+            let status = job_status(&job, live_status);
+            let detail = (!job.detail.is_empty()).then(|| job.detail.clone());
+            let task = (!job.name.is_empty()).then(|| job.name.clone());
+
+            let Some(agent) = self.agents.iter_mut().find(|a| a.id == id) else {
+                self.agents.push(Agent {
+                    id,
+                    tool: "claude".to_string(),
+                    session_id: job.id.clone(),
+                    status,
+                    cwd: job.cwd.clone(),
+                    task,
+                    detail,
+                    turns: 0,
+                    status_since: self.now,
+                    last_report: self.now,
+                    spool_ts: 0.0,
+                    tab: None,
+                    // The account the agent belongs to, which is the one thing
+                    // a background row cannot derive from a session name.
+                    pane_title: job.acct.clone(),
+                    alive: true,
+                    perm_mode: String::new(),
+                    model: String::new(),
+                    repo: String::new(),
+                    wt: String::new(),
+                    branch: String::new(),
+                    followup_queued: false,
+                    subagents: fan_subagents(job.fan, self.now),
+                    tasks_total: 0,
+                    tasks_done: 0,
+                    session_alive: true,
+                    notified: false,
+                    block: (status == Status::Waiting).then_some(Block::Idle),
+                });
+                changed = true;
+                continue;
+            };
+            // `status_since` is what the elapsed column counts from, so it may
+            // only move when the status actually does - refreshing it on every
+            // poll would peg every row at a few seconds old.
+            if agent.status != status {
+                agent.status = status;
+                agent.status_since = self.now;
+                changed = true;
+            }
+            if agent.task != task || agent.detail != detail || agent.cwd != job.cwd {
+                agent.task = task;
+                agent.detail = detail;
+                agent.cwd = job.cwd.clone();
+                changed = true;
+            }
+            if agent.subagents_live() != job.fan as usize {
+                agent.subagents = fan_subagents(job.fan, self.now);
+                changed = true;
+            }
+            agent.block = (status == Status::Waiting).then_some(Block::Idle);
+            agent.pane_title = job.acct.clone();
+            agent.last_report = self.now;
+            agent.session_alive = true;
         }
         changed
     }
@@ -3349,6 +3538,7 @@ mod cross_session_tests {
             spooled,
             live: live.iter().map(|s| s.to_string()).collect(),
             complete: true,
+            ..Default::default()
         }
     }
 
@@ -4149,5 +4339,236 @@ mod cross_session_tests {
         s.handle_status(&args(&[("pane_id", "1"), ("status", "working")]));
         s.handle_status(&args(&[("pane_id", "1"), ("status", "waiting")]));
         assert!(!s.agents[0].notified);
+    }
+}
+
+/// Background agents from Claude Code's agent view: rows with a job id instead
+/// of a pane, which the process scan cannot see and no hook pipes for.
+#[cfg(test)]
+mod background_agent_tests {
+    use super::*;
+    use crate::agent::{job_pane_id, AgentId, BG_SESSION};
+
+    fn state() -> State {
+        State {
+            permissions_granted: true,
+            popup_on_waiting: false,
+            session_name: "mob".into(),
+            live_sessions: vec!["mob".into()],
+            scanned_sessions: vec!["mob".into()],
+            discover: true,
+            ..Default::default()
+        }
+    }
+
+    fn job(id: &str, state: &str, tempo: &str, age: i64) -> crate::discover::Job {
+        crate::discover::Job {
+            id: id.into(),
+            acct: "personal".into(),
+            state: state.into(),
+            tempo: tempo.into(),
+            age,
+            fan: 0,
+            terminated: state == "done",
+            cwd: "/repo".into(),
+            name: "a task".into(),
+            detail: "doing a thing".into(),
+        }
+    }
+
+    fn scan_of(jobs: Vec<crate::discover::Job>) -> crate::discover::Scan {
+        crate::discover::Scan {
+            live: vec!["mob".into()],
+            complete: true,
+            jobs,
+            ..Default::default()
+        }
+    }
+
+    fn bg_id(id: &str) -> AgentId {
+        AgentId {
+            session: BG_SESSION.into(),
+            pane_id: job_pane_id(id).unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_background_agent_becomes_a_row() {
+        let mut s = state();
+        s.apply_scan_result(scan_of(vec![job("3848ccf2", "working", "active", 5)]));
+        assert_eq!(s.agents.len(), 1);
+        assert_eq!(s.agents[0].id, bg_id("3848ccf2"));
+        assert_eq!(s.agents[0].status, Status::Working);
+        assert_eq!(s.agents[0].task.as_deref(), Some("a task"));
+        assert_eq!(s.agents[0].detail.as_deref(), Some("doing a thing"));
+        assert_eq!(s.agents[0].cwd, "/repo");
+    }
+
+    /// The agent view's vocabulary, mapped onto the panel's. `blocked` is the
+    /// one that matters: it has to rank with the prompts so it sorts to the top.
+    #[test]
+    fn agent_view_states_map_onto_panel_statuses() {
+        let cases = [
+            ("blocked", "blocked", Status::Waiting),
+            ("working", "active", Status::Working),
+            ("working", "idle", Status::IdleWait),
+            ("working", "blocked", Status::Waiting),
+            ("done", "idle", Status::Done),
+            ("something-new", "idle", Status::Idle),
+        ];
+        for (state_s, tempo, want) in cases {
+            let mut s = state();
+            s.apply_scan_result(scan_of(vec![job("3848ccf2", state_s, tempo, 5)]));
+            assert_eq!(
+                s.agents[0].status, want,
+                "state={:?} tempo={:?} should map to {:?}",
+                state_s, tempo, want
+            );
+        }
+    }
+
+    /// A blocked agent outranks a working one, which is the entire reason the
+    /// panel bothers to show background agents at all.
+    #[test]
+    fn a_blocked_background_agent_sorts_above_a_working_one() {
+        let mut s = state();
+        s.apply_scan_result(scan_of(vec![
+            job("aaaaaaaa", "working", "active", 5),
+            job("bbbbbbbb", "blocked", "blocked", 900),
+        ]));
+        assert_eq!(s.agents[0].id, bg_id("bbbbbbbb"), "blocked sorts first");
+    }
+
+    #[test]
+    fn a_finished_agent_ages_off_the_list_but_a_blocked_one_never_does() {
+        let mut s = state();
+        s.apply_scan_result(scan_of(vec![
+            job("aaaaaaaa", "done", "idle", crate::JOB_DONE_WINDOW - 1),
+            job("bbbbbbbb", "done", "idle", crate::JOB_DONE_WINDOW + 1),
+            // Older than any window, and still the row you need most.
+            job("cccccccc", "blocked", "blocked", crate::JOB_DONE_WINDOW * 100),
+        ]));
+        let ids: Vec<AgentId> = s.agents.iter().map(|a| a.id.clone()).collect();
+        assert!(ids.contains(&bg_id("aaaaaaaa")), "a recent finish is still shown");
+        assert!(!ids.contains(&bg_id("bbbbbbbb")), "an old finish is aged out");
+        assert!(ids.contains(&bg_id("cccccccc")), "a blocked agent is never aged out");
+    }
+
+    /// An unparseable timestamp must not read as "just now".
+    #[test]
+    fn an_unknown_age_ages_out_rather_than_pinning_the_row() {
+        let mut s = state();
+        s.apply_scan_result(scan_of(vec![job("aaaaaaaa", "done", "idle", -1)]));
+        assert!(s.agents.is_empty());
+    }
+
+    /// The row is owned by the job scan end to end, so a scan that stops
+    /// reporting it must take it away.
+    #[test]
+    fn a_vanished_job_loses_its_row() {
+        let mut s = state();
+        s.apply_scan_result(scan_of(vec![job("3848ccf2", "working", "active", 5)]));
+        assert_eq!(s.agents.len(), 1);
+        s.apply_scan_result(scan_of(vec![]));
+        assert!(s.agents.is_empty());
+    }
+
+    /// The regression the whole merge order exists to prevent: the process scan
+    /// cannot see an agent with no pane, so letting it cull one would destroy
+    /// and rebuild the row on every scan - resetting the elapsed clock and
+    /// leaving the panel permanently dirty.
+    #[test]
+    fn the_process_scan_does_not_cull_a_background_row() {
+        let mut s = state();
+        s.apply_scan_result(scan_of(vec![job("3848ccf2", "working", "active", 5)]));
+        s.now = 90.0;
+        let before = s.agents[0].status_since;
+
+        // A scan that finds a pane agent and says nothing about any job.
+        s.apply_scan_result(crate::discover::Scan {
+            found: vec![crate::discover::Found {
+                session: "mob".into(),
+                pane_id: 2,
+                tool: "claude".into(),
+            }],
+            live: vec!["mob".into()],
+            complete: true,
+            jobs: vec![job("3848ccf2", "working", "active", 5)],
+            ..Default::default()
+        });
+
+        let bg = s
+            .agents
+            .iter()
+            .find(|a| a.id == bg_id("3848ccf2"))
+            .expect("row survives");
+        assert_eq!(bg.status, Status::Working, "still working, not rebuilt");
+        assert_eq!(bg.status_since, before, "the elapsed clock did not restart");
+        assert_eq!(s.agents.len(), 2, "the pane agent joined it rather than replacing it");
+    }
+
+    /// The other half of the same regression: a background agent is in no
+    /// Zellij session, so the liveness sweep must not read "not in the session
+    /// list" as "dead".
+    #[test]
+    fn the_liveness_sweep_does_not_mark_a_background_row_unknown() {
+        let mut s = state();
+        s.apply_scan_result(scan_of(vec![job("3848ccf2", "working", "active", 5)]));
+        s.apply_sessions(vec!["mob".into(), "other".into()]);
+        let bg = &s.agents[0];
+        assert!(bg.session_alive, "a background agent has no session to lose");
+        assert_eq!(bg.status, Status::Working);
+    }
+
+    /// `--json` answers for one account only, so its silence about a row from
+    /// another account is not evidence of anything.
+    #[test]
+    fn the_live_pass_refines_a_row_without_being_able_to_remove_one() {
+        let mut s = state();
+        s.apply_scan_result(crate::discover::Scan {
+            live: vec!["mob".into()],
+            complete: true,
+            jobs: vec![job("3848ccf2", "working", "active", 5)],
+            job_live: vec![crate::discover::JobLive {
+                id: "3848ccf2".into(),
+                status: "idle".into(),
+            }],
+            ..Default::default()
+        });
+        assert_eq!(s.agents.len(), 1);
+        assert_eq!(
+            s.agents[0].status,
+            Status::IdleWait,
+            "a live status of idle means it is sitting at a prompt"
+        );
+    }
+
+    /// Typing goes to a pty and these rows have none, so the keys that would
+    /// write into one must refuse rather than address a pane that is really a
+    /// packed job id.
+    #[test]
+    fn the_pane_only_keys_refuse_on_a_background_row() {
+        let mut s = state();
+        s.apply_scan_result(scan_of(vec![job("3848ccf2", "blocked", "blocked", 5)]));
+        s.selected = 0;
+        assert_eq!(
+            s.agents[0].status,
+            Status::Waiting,
+            "blocked, so reply would otherwise be offered"
+        );
+        assert!(!s.can_reply_selected(), "no pty to type into");
+        assert!(!s.begin_followup(), "nothing would ever consume the follow-up file");
+    }
+
+    /// The row has to say which account it belongs to: two background agents
+    /// are otherwise indistinguishable, and `@bg` is an internal key.
+    #[test]
+    fn a_background_row_names_its_account_not_the_internal_key() {
+        let mut s = state();
+        s.apply_scan_result(scan_of(vec![job("3848ccf2", "working", "active", 5)]));
+        let shown = s.agents[0].display_session();
+        assert_eq!(shown, "agents/personal");
+        assert!(!shown.contains(BG_SESSION), "the internal key never reaches the screen");
+        assert_eq!(s.agents[0].locator(), "id:3848ccf2", "the id claude attach takes");
     }
 }
