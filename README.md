@@ -15,6 +15,8 @@ A blocked agent is invisible until you happen to cycle past its pane. Rows sort
 by urgency, so whatever needs you most sits at the top.
 
 - **Every agent at once**, across sessions, with live status and the task each is on.
+- **Background agents too**, from Claude Code's own agent view (`claude agents`) —
+  the ones running under the daemon with no pane at all, across every account.
 - **Jump to any pane** with <kbd>Enter</kbd>, across tabs *and* sessions.
 - **Fuzzy find** with <kbd>/</kbd>: a few characters of a task, worktree, or
   session narrows the list to it.
@@ -26,6 +28,13 @@ by urgency, so whatever needs you most sits at the top.
   disposable status file for other sessions to read.
 
 > Inspired by [herdr](https://herdr.dev), without adopting an entire new multiplexer.
+
+> **This fork** adds the background agents from Claude Code's agent view to the
+> panel. Upstream finds agents by scanning for processes that inherited
+> `ZELLIJ_PANE_ID`, so it sees only agents running in a pane; a `claude --bg`
+> session has a pid but no pane, no `ZELLIJ_*` environment and no hook piping
+> into any session, which made exactly the unattended agents invisible. See
+> [how it works](docs/how-it-works.md#background-agents-from-the-agent-view).
 
 **Docs:** [setup](docs/setup.md) ·
 [how it works](docs/how-it-works.md) ·

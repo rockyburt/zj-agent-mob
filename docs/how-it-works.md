@@ -1,6 +1,7 @@
 # How it works
 
 - [Status transport](#status-transport)
+- [Background agents from the agent view](#background-agents-from-the-agent-view)
 - [Cross-session status: the spool](#cross-session-status-the-spool)
 - [In-flight tool timing](#in-flight-tool-timing)
 - [Answering prompts without being asked](#answering-prompts-without-being-asked)
@@ -48,6 +49,76 @@ still blocked on the same thing.
 
 An unrecognized value is dropped rather than guessed, so an older installed hook
 sending something new degrades to no label instead of a wrong one.
+
+## Background agents from the agent view
+
+Everything above depends on `$ZELLIJ_PANE_ID`. Claude Code's agent view
+(`claude agents`, or `claude --bg`) runs sessions under a daemon instead: they
+have a pid but no pane, no `ZELLIJ_*` environment, and no hook piping into any
+session. That made the agents *most* likely to be blocked on you while you are
+elsewhere the ones the panel could not see at all.
+
+They are discovered by two passes with the same asymmetry the spool has, where
+one source asserts existence and the other only refines it:
+
+| Pass | Reads | Owns |
+|---|---|---|
+| Job state | `~/.claude*/jobs/<id>/state.json` | Whether a row exists, and everything it renders |
+| Live | `claude agents --json` | The live `busy`/`idle` status, nothing else |
+
+The job record carries the agent view's own `detail` line, its `tempo`, the
+subagent fan-out and the token count, so a row says what the agent view says.
+
+**The passes are that way round because of a CLI quirk:** `claude agents --json`
+ignores `CLAUDE_CONFIG_DIR`. It answers for whichever account it resolves by
+itself, so running it once per config dir returns *that same account's* agents
+every time — the same rows duplicated, not each account's. A fleet routinely
+spans accounts, so the job directories are globbed and read directly, and the
+live pass runs exactly once. `--json` also lists only *active* sessions, so a
+row it omits may simply have finished; completed agents are aged out on their
+own timestamp rather than culled for being absent from it.
+
+`age` is computed in the shell and sent as seconds, because the plugin has no
+wall clock — the same constraint behind `tool_secs` and the spool's relative
+dating.
+
+### One identity for two kinds of agent
+
+Background rows reuse `AgentId` rather than threading a second identity type
+through every row, sort and lookup. They take the reserved session key `@bg`,
+which no real session can collide with: `sanitize_session` folds every byte
+outside `[A-Za-z0-9._-]`, so nothing can sanitize to a key containing `@`. The
+eight-hex job id packs into `pane_id` and round-trips exactly through `{:08x}`,
+which is how a row rebuilds the id `claude attach` and `claude stop` take
+without carrying it separately. On screen the row shows `agents/<account>` and
+`id:<job>` rather than a session and a pane number.
+
+Two culling paths have to leave these rows alone, and both would have destroyed
+and rebuilt the row on every scan — resetting its elapsed clock and leaving the
+panel permanently dirty. `merge_found` must not cull a row the process scan
+cannot see, and `apply_liveness` must not read "in no Zellij session" as "dead".
+
+### What the keys do instead
+
+| Key | Pane agent | Background agent |
+|---|---|---|
+| <kbd>Enter</kbd> | Focus the pane | Open a pane running `claude attach <id>` |
+| <kbd>x</kbd> <kbd>x</kbd> | Interrupt, then close the pane | Arm, then `claude stop <id>` |
+| <kbd>y</kbd> / <kbd>m</kbd> / <kbd>f</kbd> | Reply, queue a follow-up | Refused |
+
+Reply and follow-up are refused rather than attempted. Both reach an agent
+through a pty or a file keyed by session and pane, and a background agent has
+neither — a write would address an unrelated pane, or none, and report success
+either way.
+
+A finished background agent stays listed for `JOB_DONE_WINDOW` (six hours), so
+the panel shows the working day without filling with last week's runs. Blocked
+and working agents are never aged out: how long an agent has been blocked is the
+most useful thing the panel can tell you.
+
+Set `ZJ_AGENT_JOBS=0` to switch the whole pass off; the panel falls back to pane
+agents alone. It also no-ops silently when `jq` or the `claude` binary is
+missing.
 
 ## Cross-session status: the spool
 

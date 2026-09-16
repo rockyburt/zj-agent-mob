@@ -804,3 +804,49 @@ mod tests {
         }
     }
 }
+
+/// Runs the real scan against the real machine, which is the only thing that
+/// exercises the shell, jq, the CLI and the parser together. Machine-dependent
+/// by nature - it asserts the scan is well-formed, never what it finds - so it
+/// is opt-in:
+///
+///     cargo test --lib real_scan -- --ignored --nocapture
+#[cfg(test)]
+mod real_scan {
+    use super::*;
+
+    #[test]
+    #[ignore = "depends on the agents running on this machine"]
+    fn the_whole_scan_script_runs_and_parses() {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(scan_script(&TOOLS))
+            .output()
+            .expect("sh runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        // The job pass sits between the spool read and the beacon sweep, so a
+        // broken fragment shows up as a truncated scan rather than a loud error.
+        assert!(stderr.is_empty(), "the scan must be silent, got: {}", stderr);
+        let scan = parse(&stdout);
+        assert!(scan.complete, "SCANEND must still terminate the scan");
+
+        for j in &scan.jobs {
+            assert!(crate::agent::job_pane_id(&j.id).is_some(), "unusable id {:?}", j.id);
+            assert!(!j.acct.is_empty(), "every job knows its account");
+        }
+        eprintln!(
+            "live sessions: {:?}\npane agents:   {}\nbackground:    {}",
+            scan.live,
+            scan.found.len(),
+            scan.jobs.len()
+        );
+        for j in &scan.jobs {
+            eprintln!(
+                "  {} [{}] {}/{} fan={} age={}s  {}",
+                j.id, j.acct, j.state, j.tempo, j.fan, j.age, j.name
+            );
+        }
+    }
+}
