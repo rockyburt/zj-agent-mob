@@ -117,11 +117,17 @@ pub(crate) fn scan_script(tools: &[&str]) -> String {
     if (s != "") print "LIVE", s
   }}
   if ({guard}) next
-  pane = ""; sess = ""
+  # The agent-view daemon and its helpers are claude processes too, and carry
+  # the ZELLIJ_* of whatever pane the daemon was first started in. They are
+  # not agents in a pane: the job scan covers what they run.
+  if ($3 == "daemon" || $3 == "bg-pty-host" || $3 == "bg-spare") next
+  pane = ""; sess = ""; bg = 0
   for (i = 3; i <= NF; i++) {{
     if ($i ~ /^ZELLIJ_PANE_ID=/)      pane = substr($i, 16)
     if ($i ~ /^ZELLIJ_SESSION_NAME=/) sess = substr($i, 21)
+    if ($i == "CLAUDE_CODE_SESSION_KIND=bg") bg = 1
   }}
+  if (bg) next
   if (pane != "" && sess != "") print "SCAN", sess, pane, cmd
 }}' | sort -u
 SPOOL_DIR="${{ZJ_AGENT_SPOOL_DIR:-${{TMPDIR:-/tmp}}/zj-agent-mob-$(id -u 2>/dev/null || echo 0)/status}}"
@@ -680,6 +686,30 @@ mod tests {
                 run("all", PROCS),
                 "SCAN mob 2 claude\nSCAN mob 3 claude\nSCAN mob 6 codex\nSCAN other 11 claude\nSCANEND\n"
             );
+        }
+
+        /// The agent-view daemon, its helpers and the sessions it dispatches all
+        /// carry the ZELLIJ_* of whatever pane the daemon started in. None of
+        /// them is an agent in that pane, so none may become a pane row - the
+        /// job scan is what lists them.
+        #[test]
+        fn agent_view_processes_are_not_pane_agents() {
+            let procs = concat!(
+                "45985 claude ZELLIJ=0 ZELLIJ_PANE_ID=2 ZELLIJ_SESSION_NAME=mob\n",
+                "1123974 /home/x/.local/bin/claude daemon run --origin transient ZELLIJ_PANE_ID=0 ZELLIJ_SESSION_NAME=gone\n",
+                "1124000 claude bg-pty-host --bg-pty-host /tmp/x.pty ZELLIJ_PANE_ID=0 ZELLIJ_SESSION_NAME=gone\n",
+                "1124006 claude bg-spare --bg-spare /tmp/x.sock ZELLIJ_PANE_ID=0 ZELLIJ_SESSION_NAME=gone\n",
+                "1124010 claude --resume abc CLAUDE_CODE_SESSION_KIND=bg ZELLIJ_PANE_ID=0 ZELLIJ_SESSION_NAME=gone\n",
+            );
+            assert_eq!(run("agentview", procs), "SCAN mob 2 claude\nSCANEND\n");
+        }
+
+        /// Only the exact marker excludes a process: some other session kind is
+        /// still an agent in its pane.
+        #[test]
+        fn another_session_kind_is_still_a_pane_agent() {
+            let procs = "45985 claude CLAUDE_CODE_SESSION_KIND=interactive ZELLIJ_PANE_ID=2 ZELLIJ_SESSION_NAME=mob\n";
+            assert_eq!(run("kind", procs), "SCAN mob 2 claude\nSCANEND\n");
         }
 
         /// `sort -u` keys on the whole line, so a pane number repeated in another

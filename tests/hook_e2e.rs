@@ -2412,3 +2412,48 @@ fn a_hanging_panel_still_leaves_a_spool_record() {
         record
     );
 }
+
+// ---------------------------------------------------------------------------
+// background sessions from the agent view
+// ---------------------------------------------------------------------------
+
+/// The agent-view daemon hands every session it dispatches the ZELLIJ_* of the
+/// pane it was first started in, so a background agent looks exactly like pane
+/// 0 of some long-gone session. Reporting as that pane makes one phantom row of
+/// every background agent and pipes into a session that no longer exists.
+#[test]
+fn a_background_session_reports_nothing() {
+    for (k, v) in [
+        ("CLAUDE_JOB_DIR", "/home/x/.claude/jobs/3848ccf2"),
+        ("CLAUDE_CODE_SESSION_KIND", "bg"),
+    ] {
+        let run = Hook::new()
+            .env(k, v)
+            .env("ZELLIJ_SESSION_NAME", "adamant-cowbell")
+            .run(&ev("UserPromptSubmit"));
+        assert!(run.silent(), "{k}={v} must not pipe anything, got {:?}", run.pipes);
+    }
+}
+
+/// The bail-out has to come before anything is spawned: a background agent
+/// fires these hooks constantly and would otherwise still pay for each one.
+#[test]
+fn a_background_session_writes_no_spool_record() {
+    let h = Hook::new();
+    h.env("CLAUDE_JOB_DIR", "/home/x/.claude/jobs/3848ccf2")
+        .env("ZELLIJ_SESSION_NAME", "adamant-cowbell")
+        .run(&ev("PreToolUse"));
+    assert!(
+        !h.path("spool").exists(),
+        "a background session must not create a phantom pane record"
+    );
+}
+
+/// Only the exact marker counts: any other session kind is still a pane agent.
+#[test]
+fn another_session_kind_still_reports() {
+    let run = Hook::new()
+        .env("CLAUDE_CODE_SESSION_KIND", "interactive")
+        .run(&ev("UserPromptSubmit"));
+    assert!(!run.silent(), "a non-background session must still report");
+}

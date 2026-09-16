@@ -35,6 +35,23 @@ case "$ZELLIJ_PANE_ID" in
   *[!0-9]*) exit 0 ;;
 esac
 
+# Background sessions from Claude Code's agent view are not in a pane, whatever
+# their environment says. The daemon that spawns them inherits ZELLIJ_* from
+# whichever pane it was first started in, and every session it dispatches
+# inherits that in turn - so all of them claim to be the same pane of a session
+# that has usually been closed or renamed since. Reporting as that pane makes
+# one phantom row out of every background agent, and piping into a session that
+# no longer exists blocks, once per event: under zellaude that leaked a hung
+# `zellij pipe` per tool call, thousands in a day.
+#
+# The panel already covers these agents from their job state (discover.rs), so
+# the hook has nothing to add and bows out before it spawns anything.
+# CLAUDE_JOB_DIR is what the session exports to its children;
+# CLAUDE_CODE_SESSION_KIND=bg is on the process itself, and is checked too in
+# case a later release stops exporting the first.
+[ -n "${CLAUDE_JOB_DIR:-}" ] && exit 0
+[ "${CLAUDE_CODE_SESSION_KIND:-}" = bg ] && exit 0
+
 command -v jq >/dev/null 2>&1 || exit 0
 command -v zellij >/dev/null 2>&1 || exit 0
 

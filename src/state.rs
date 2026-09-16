@@ -3953,6 +3953,11 @@ mod cross_session_tests {
                 .env("ZELLIJ_PANE_ID", "7")
                 .env("ZELLIJ_SESSION_NAME", "other")
                 .env("ZJ_AGENT_SPOOL_DIR", &spool)
+                // This test plays a pane agent. Run from inside a Claude Code
+                // background session, it would inherit that session's markers
+                // and the hook would rightly stay silent.
+                .env_remove("CLAUDE_JOB_DIR")
+                .env_remove("CLAUDE_CODE_SESSION_KIND")
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::null())
                 .spawn()
@@ -3969,6 +3974,8 @@ mod cross_session_tests {
             .arg("-c")
             .arg(&script)
             .env("ZJ_AGENT_SPOOL_DIR", &spool)
+            // The job pass reads the real $HOME; this is about the spool.
+            .env("ZJ_AGENT_JOBS", "0")
             .output()
             .expect("scan runs");
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
