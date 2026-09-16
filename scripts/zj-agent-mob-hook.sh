@@ -18,6 +18,7 @@
 #   ZJ_AGENT_SPOOL       0 disables the cross-session status spool
 #   ZJ_AGENT_SPOOL_DIR   override spool location
 #   ZJ_AGENT_FANOUT      0 disables piping urgent transitions to other sessions
+#   ZJ_AGENT_PIPE_TIMEOUT seconds a status pipe may take (default 5)
 
 # SC2154: event, session_id, cwd, transcript and tool_name are all assigned by
 # the `eval` of jq's @sh output below, which shellcheck cannot follow.
@@ -82,6 +83,39 @@ spool_dir() {
     printf '%s' "$ZJ_AGENT_SPOOL_DIR"
   else
     printf '%s/zj-agent-mob-%s/status' "${TMPDIR:-/tmp}" "$(id -u 2>/dev/null || echo 0)"
+  fi
+}
+
+# Fire-and-forget status to a panel: $1 is a session to target, empty for our
+# own. Nothing reads the result, so it is bounded and its failure ignored.
+#
+# The bound matters because `--plugin` *launches* the plugin if it is not
+# already running, and a launch is not always fast: the first one after the wasm
+# changes recompiles it, and a plugin whose permissions have not been granted
+# yet sits behind a consent dialog until someone answers it. Three of these
+# hooks are synchronous so they can answer, continue, or inform a turn, and a
+# synchronous hook that blocks stalls the turn it belongs to - which surfaces to
+# the user as "UserPromptSubmit hook timed out after 30s", with the prompt's
+# whole hook output discarded.
+#
+# Losing one status update is invisible: the next event resends, and the spool
+# write below this is what cross-session visibility actually rides on. So the
+# pipe gets a short leash and the turn never waits on the panel.
+#
+# `timeout` is coreutils and absent on a stock macOS, so its absence falls back
+# to the unbounded call rather than dropping the status entirely.
+status_pipe() {
+  _sess=$1
+  _args=$2
+  if [ -n "$_sess" ]; then
+    set -- zellij --session "$_sess" pipe --name agent-status --plugin "$PLUGIN" --args "$_args"
+  else
+    set -- zellij pipe --name agent-status --plugin "$PLUGIN" --args "$_args"
+  fi
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${ZJ_AGENT_PIPE_TIMEOUT:-5}" "$@" >/dev/null 2>&1 || true
+  else
+    "$@" >/dev/null 2>&1 || true
   fi
 }
 
@@ -361,7 +395,7 @@ fi
 
 ARGS="pane_id=$ZELLIJ_PANE_ID,session=$SESSION,tool=$TOOL,status=$status,session_id=$session_id,cwd=$cwd,task=$task,detail=$detail,block=$block,perm_mode=$perm_mode,model=$model,agent_type=$agent_type,agent_id=$agent_id,repo=$repo,wt=$wt,branch=$branch,tool_secs=$tool_secs,subagent_delta=$subagent_delta,task_delta=$task_delta,task_done_delta=$task_done_delta"
 
-zellij pipe --name agent-status --plugin "$PLUGIN" --args "$ARGS" >/dev/null 2>&1 || true
+status_pipe "" "$ARGS"
 
 # The pipe above reaches only this session's plugin. A panel in another session
 # otherwise waits for its next poll to notice, which is too slow for the states
@@ -381,8 +415,7 @@ case "$status" in
         [ "$key" = "$SESSION" ] && continue
         target=$(head -n 1 "$beacon" 2>/dev/null)
         [ -n "$target" ] || target=$key
-        zellij --session "$target" pipe --name agent-status \
-          --plugin "$PLUGIN" --args "$ARGS" >/dev/null 2>&1 || true
+        status_pipe "$target" "$ARGS"
       done
     fi ;;
 esac
