@@ -2343,3 +2343,72 @@ fn the_fleet_note_can_be_switched_off() {
     let r = h.env("ZJ_AGENT_CONTEXT", "0").run(&json);
     assert!(!r.stdout.contains("additionalContext"), "{:?}", r.stdout);
 }
+
+// ---------------------------------------------------------------------------
+// a slow panel must not stall the turn
+// ---------------------------------------------------------------------------
+
+/// `--plugin` *launches* the plugin when it is not already running, and a
+/// launch is not always fast: the first one after the wasm changes recompiles
+/// it, and a plugin whose permissions have not been granted yet sits behind a
+/// consent dialog until someone answers. `UserPromptSubmit`, `PermissionRequest`
+/// and `Stop` are synchronous so they can inform or answer a turn, so a pipe
+/// that blocks stalls the turn - which the user sees as
+/// "UserPromptSubmit hook timed out after 30s", with the whole hook output
+/// discarded.
+///
+/// Losing one status update is invisible; stalling a turn is not.
+#[test]
+fn a_hanging_panel_does_not_stall_a_synchronous_hook() {
+    let hook = Hook::new();
+    // A `zellij` that never returns, which is what a launch behind an
+    // unanswered permission dialog looks like from the hook's side.
+    let stub = hook.path("bin").join("zellij");
+    fs::write(&stub, "#!/bin/sh\nsleep 60\n").expect("write hanging stub");
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+
+    let json = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "hello",
+    })
+    .to_string();
+
+    let started = std::time::Instant::now();
+    hook.env("ZJ_AGENT_PIPE_TIMEOUT", "1").run(&json);
+    let took = started.elapsed();
+
+    assert!(
+        took < std::time::Duration::from_secs(20),
+        "the hook waited {:?} on a hanging panel; it must give up and let the turn continue",
+        took
+    );
+}
+
+/// The whole point of bounding the pipe rather than dropping it: the record the
+/// panel actually reads cross-session is still written after a pipe gives up.
+#[test]
+fn a_hanging_panel_still_leaves_a_spool_record() {
+    let hook = Hook::new();
+    let stub = hook.path("bin").join("zellij");
+    fs::write(&stub, "#!/bin/sh\nsleep 60\n").expect("write hanging stub");
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+
+    let json = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "uuid-1",
+        "cwd": "/Users/x/Projects/web",
+    })
+    .to_string();
+    hook.env("ZJ_AGENT_PIPE_TIMEOUT", "1")
+        .env("ZELLIJ_SESSION_NAME", "mob")
+        .run(&json);
+
+    // Read the record itself: the pipe is what hung, so the captured argv a
+    // `field()` lookup reads is exactly what this test cannot rely on.
+    let record = fs::read_to_string(hook.path("spool/mob.3")).expect("spool record written despite a dead panel");
+    assert!(
+        record.contains("session_id=uuid-1"),
+        "the record must still describe the agent: {:?}",
+        record
+    );
+}
