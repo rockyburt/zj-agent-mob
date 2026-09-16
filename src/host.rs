@@ -161,6 +161,27 @@ pub(crate) fn session_action(session: &str, args: &[&str], kind: &str) {
     run_command(&argv, ctx);
 }
 
+/// The script behind `publish_summary`, kept outside the wasm-only function so
+/// the `@default` resolution can be tested against a real shell.
+///
+/// The summary reaches a file and a pipe, so it is bound as a positional rather
+/// than spliced into the command string. The prose line and the `k=v` line are
+/// written as two files, both atomically: a consumer reading mid-write would
+/// otherwise see a truncated count and render it as fact.
+///
+/// `@default` is resolved here because only the host knows `$TMPDIR` and the
+/// uid; see `DEFAULT_SUMMARY`.
+#[cfg(any(target_family = "wasm", test))]
+pub(crate) const SUMMARY_SCRIPT: &str = "p=$2; \
+     if [ \"$p\" = @default ]; then \
+       d=\"${TMPDIR:-/tmp}/zj-agent-mob-$(id -u 2>/dev/null || echo 0)\"; \
+       [ -d \"$d\" ] || mkdir -p \"$d\" 2>/dev/null; \
+       p=\"$d/summary\"; \
+     fi; \
+     printf '%s' \"$1\" > \"$p.tmp\" 2>/dev/null && mv -f \"$p.tmp\" \"$p\" 2>/dev/null; \
+     printf '%s' \"$3\" > \"$p.kv.tmp\" 2>/dev/null && mv -f \"$p.kv.tmp\" \"$p.kv\" 2>/dev/null; \
+     command -v zellij >/dev/null 2>&1 && zellij pipe --name zj-agent-mob-summary -- \"$1\" >/dev/null 2>&1 || true";
+
 /// Publishes the one-line fleet summary for status bars to render. `zellij pipe`
 /// with no `--plugin` reaches every listening plugin, and the spool file serves
 /// consumers that are not plugins at all.
@@ -168,25 +189,7 @@ pub(crate) fn session_action(session: &str, args: &[&str], kind: &str) {
 pub(crate) fn publish_summary(summary: &str, path: &str, kv: &str) {
     let mut ctx = std::collections::BTreeMap::new();
     ctx.insert("kind".to_string(), "summary".to_string());
-    run_command(
-        &[
-            "sh",
-            "-c",
-            // The summary reaches a file and a pipe, so it is bound as a
-            // positional rather than spliced into the command string.
-            // The prose line and the `k=v` line are written as two files, both
-            // atomically: a consumer reading mid-write would otherwise see a
-            // truncated count and render it as fact.
-            "printf '%s' \"$1\" > \"$2.tmp\" 2>/dev/null && mv -f \"$2.tmp\" \"$2\" 2>/dev/null; \
-             printf '%s' \"$3\" > \"$2.kv.tmp\" 2>/dev/null && mv -f \"$2.kv.tmp\" \"$2.kv\" 2>/dev/null; \
-             command -v zellij >/dev/null 2>&1 && zellij pipe --name zj-agent-mob-summary -- \"$1\" >/dev/null 2>&1 || true",
-            "sh",
-            summary,
-            path,
-            kv,
-        ],
-        ctx,
-    );
+    run_command(&["sh", "-c", SUMMARY_SCRIPT, "sh", summary, path, kv], ctx);
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -226,3 +229,73 @@ mod stub {
 }
 #[cfg(not(target_family = "wasm"))]
 pub(crate) use stub::*;
+
+#[cfg(test)]
+mod summary_script_tests {
+    use super::SUMMARY_SCRIPT;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    /// Runs the script with `$TMPDIR` pointed at a scratch dir and a `zellij`
+    /// that does nothing, so the test never pipes into a real session.
+    fn publish(tmp: &std::path::Path, path: &str) {
+        let bin = tmp.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let stub = bin.join("zellij");
+        fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        let path_env = format!("{}:/usr/bin:/bin", bin.display());
+        let status = Command::new("sh")
+            .args([
+                "-c",
+                SUMMARY_SCRIPT,
+                "sh",
+                "1 waiting",
+                path,
+                "failed=0 waiting=1 total=1",
+            ])
+            .env("TMPDIR", tmp)
+            .env("PATH", path_env)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("zjam-summary-{}-{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The default lands beside the spool, where a status line can find it
+    /// knowing only `$TMPDIR` and its own uid.
+    #[test]
+    fn the_default_token_resolves_beside_the_spool() {
+        let tmp = scratch("default");
+        publish(&tmp, "@default");
+        let uid = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout).unwrap();
+        let dir = tmp.join(format!("zj-agent-mob-{}", uid.trim()));
+        assert_eq!(fs::read_to_string(dir.join("summary")).unwrap(), "1 waiting");
+        assert_eq!(
+            fs::read_to_string(dir.join("summary.kv")).unwrap(),
+            "failed=0 waiting=1 total=1"
+        );
+        assert!(
+            !tmp.join("@default").exists(),
+            "the token must never be used as a literal path"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn an_explicit_path_is_used_as_given() {
+        let tmp = scratch("explicit");
+        let target = tmp.join("custom.summary");
+        publish(&tmp, target.to_str().unwrap());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "1 waiting");
+        assert!(tmp.join("custom.summary.kv").exists());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}

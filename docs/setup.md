@@ -226,11 +226,21 @@ vX.Y.Z` from a shell still updates (or downgrades) manually.
 
 ## The fleet summary in your status bar
 
-Set `summary_file` and the panel publishes the fleet's state on every change,
-for anything outside Zellij to render. This is the difference between a panel
-you open and a number that is always in front of you.
+The panel publishes the fleet's state on every change, for anything outside
+Zellij to render. This is the difference between a panel you open and a number
+that is always in front of you.
 
-Configuration goes wherever you already declare the plugin - in a keybinding:
+**In this fork it is on by default**, written to
+`${TMPDIR:-/tmp}/zj-agent-mob-$(id -u)/summary` (and `summary.kv`) with no
+configuration at all. That is deliberate: Zellij treats the same plugin with a
+different configuration as a *different plugin* when routing a pipe, so a
+keybinding that sets `summary_file` opens an instance the hooks'
+`zellij pipe --plugin` never reaches, and the panel you open stops hearing from
+its own session's agents. Leave the plugin unconfigured and read the default
+path. `summary_file "off"` disables it, and a path overrides it, both at that
+same cost.
+
+Configuration otherwise goes wherever you already declare the plugin - in a keybinding:
 
 ```kdl
 keybinds {

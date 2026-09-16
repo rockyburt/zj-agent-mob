@@ -53,6 +53,12 @@ pub(crate) const JOB_DONE_WINDOW: i64 = 6 * 60 * 60;
 /// binary up, but every command it dispatches runs on the host, which can.
 pub(crate) const CLAUDE_BIN: &str = "claude";
 
+/// The `summary_file` used when none is configured. A token rather than a path:
+/// the plugin runs in WASI and knows neither `$TMPDIR` nor the uid, so the host
+/// shell resolves it to `${TMPDIR:-/tmp}/zj-agent-mob-<uid>/summary`, beside the
+/// spool, where a status line can find it without being told.
+pub(crate) const DEFAULT_SUMMARY: &str = "@default";
+
 /// Shown in the pane frame instead of the full wasm path.
 pub(crate) const PANE_TITLE: &str = "Agent Mob";
 

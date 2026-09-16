@@ -9,6 +9,27 @@ use crate::style::{chars, DIM_LEVEL};
 use crate::util::truncate;
 use crate::{content_width, host, ribbon, PANE_TITLE};
 
+/// Where the fleet summary goes, from the `summary_file` config value.
+///
+/// Unset publishes to the default location rather than nowhere. The summary is
+/// only useful if the panel is configured, and configuring it is exactly what
+/// breaks it: Zellij treats the same plugin with different configuration as a
+/// *different plugin* when routing a pipe, so a keybinding that carries
+/// `summary_file` opens an instance the hooks' unconfigured
+/// `zellij pipe --plugin` never reaches. The panel you open would stop hearing
+/// from its own session's agents. Defaulting it on means nobody has to pay that
+/// to get a status-bar count.
+///
+/// `off` (or an empty value) still disables it, for a setup that configures
+/// the plugin anyway and does not want the files.
+pub(crate) fn summary_path_from(configured: Option<&str>) -> String {
+    match configured {
+        None => crate::DEFAULT_SUMMARY.to_string(),
+        Some("off") | Some("") => String::new(),
+        Some(path) => path.to_string(),
+    }
+}
+
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
         self.popup_on_waiting = configuration
@@ -25,7 +46,7 @@ impl ZellijPlugin for State {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(60.0);
         self.notifier.sound = configuration.get("notify_sound").map(|v| v == "true").unwrap_or(false);
-        self.summary_path = configuration.get("summary_file").cloned().unwrap_or_default();
+        self.summary_path = summary_path_from(configuration.get("summary_file").map(String::as_str));
         self.check_updates = configuration.get("check_updates").map(|v| v != "false").unwrap_or(true);
 
         request_permission(&[
@@ -1343,5 +1364,28 @@ mod find_render_tests {
             },
         ));
         assert!(row.contains(&format!("{} ", real + 1)), "{:?}", row);
+    }
+}
+
+#[cfg(test)]
+mod summary_config_tests {
+    use super::summary_path_from;
+
+    /// Unset must publish: configuring the plugin splits it from the instance
+    /// the hooks pipe into, so "configure it to turn it on" is not an option.
+    #[test]
+    fn unset_publishes_to_the_default() {
+        assert_eq!(summary_path_from(None), crate::DEFAULT_SUMMARY);
+    }
+
+    #[test]
+    fn off_or_empty_disables_it() {
+        assert_eq!(summary_path_from(Some("off")), "");
+        assert_eq!(summary_path_from(Some("")), "");
+    }
+
+    #[test]
+    fn a_path_is_kept() {
+        assert_eq!(summary_path_from(Some("/tmp/x.summary")), "/tmp/x.summary");
     }
 }
